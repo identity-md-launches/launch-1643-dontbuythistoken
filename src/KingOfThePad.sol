@@ -86,7 +86,7 @@ contract KingOfThePad {
             if (!okDev) claimable[dev] += devShare;
         }
         emit ExtraSplit(games, burn, devShare);
-        pad.upkeep();
+        pad.upkeepFor(msg.sender); // upkeep fees (finalizer) go to the bidder, not to this contract
     }
 
     /// @notice Collect LP fees from the next n graduated pools and send the ETH to the current king.

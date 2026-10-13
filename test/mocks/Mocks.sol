@@ -58,6 +58,7 @@ contract MockPoolManager is IPoolManager {
     }
 
     mapping(bytes32 => PoolState) public pools;
+    mapping(bytes32 => bytes32) internal slotToPool; // v4 StateLibrary slot0 location => poolId
     mapping(address => int256) public delta;
     address public locker;
     address public syncedToken;
@@ -90,8 +91,18 @@ contract MockPoolManager is IPoolManager {
         }
         p.initialized = true;
         p.sqrtPriceX96 = sqrtPriceX96;
+        slotToPool[keccak256(abi.encodePacked(poolId(key), bytes32(uint256(6))))] = poolId(key);
         initializeCount++;
         return 0;
+    }
+
+    /// @dev v4 StateLibrary layout: slot0 of a pool at keccak256(poolId . POOLS_SLOT=6), sqrtPriceX96 in the low 160 bits.
+    function extsload(bytes32 slot) external view returns (bytes32) {
+        return bytes32(uint256(pools[slotToPool[slot]].sqrtPriceX96));
+    }
+
+    function _syncPrice(PoolState storage p) internal {
+        p.sqrtPriceX96 = uint160(PadLib.sqrt(PadLib.mulDiv(p.reserve1, Q96 * Q96, p.reserve0)));
     }
 
     function modifyLiquidity(PoolKey memory key, ModifyLiquidityParams memory params, bytes calldata)
@@ -133,19 +144,40 @@ contract MockPoolManager is IPoolManager {
         uint256 fee = amountIn * key.fee / 1_000_000;
         uint256 net = amountIn - fee;
         swapCount++;
+        // partial fill at the price limit, like v4: sqrtP after = sqrt(r0 r1) 2^96 / (r0 + net) (zeroForOne)
+        // or (r1 + net) 2^96 / sqrt(r0 r1) (oneForZero)
+        uint256 geo = PadLib.sqrt(p.reserve0 * p.reserve1);
         if (params.zeroForOne) {
+            require(params.sqrtPriceLimitX96 < p.sqrtPriceX96, "limit");
+            uint256 maxR0 = PadLib.mulDiv(geo, Q96, params.sqrtPriceLimitX96);
+            uint256 maxNet = maxR0 > p.reserve0 ? maxR0 - p.reserve0 : 0;
+            if (net > maxNet) {
+                net = maxNet;
+                fee = net * key.fee / (1_000_000 - key.fee);
+                amountIn = net + fee;
+            }
             uint256 out = p.reserve1 * net / (p.reserve0 + net);
             p.reserve0 += net;
             p.reserve1 -= out;
             p.fees0 += fee;
+            _syncPrice(p);
             delta[key.currency0] -= int256(amountIn);
             delta[key.currency1] += int256(out);
             return _pack(-int256(amountIn), int256(out));
         } else {
+            require(params.sqrtPriceLimitX96 > p.sqrtPriceX96, "limit");
+            uint256 maxR1 = PadLib.mulDiv(params.sqrtPriceLimitX96, geo, Q96);
+            uint256 maxNet = maxR1 > p.reserve1 ? maxR1 - p.reserve1 : 0;
+            if (net > maxNet) {
+                net = maxNet;
+                fee = net * key.fee / (1_000_000 - key.fee);
+                amountIn = net + fee;
+            }
             uint256 out = p.reserve0 * net / (p.reserve1 + net);
             p.reserve1 += net;
             p.reserve0 -= out;
             p.fees1 += fee;
+            _syncPrice(p);
             delta[key.currency1] -= int256(amountIn);
             delta[key.currency0] += int256(out);
             return _pack(int256(out), -int256(amountIn));
@@ -185,7 +217,14 @@ contract MockPoolManager is IPoolManager {
         PoolState storage p = pools[poolId(key)];
         p.fees0 += f0;
         p.fees1 += f1;
-        p.reserve1 += f1;
+    }
+
+    /// @dev Test helper: deepen a pool at its current price (the test deals the matching balances).
+    function fatten(PoolKey memory key, uint256 r0, uint256 r1) external {
+        PoolState storage p = pools[poolId(key)];
+        p.reserve0 += r0;
+        p.reserve1 += r1;
+        _syncPrice(p);
     }
 
     function getPool(PoolKey memory key) external view returns (PoolState memory) {

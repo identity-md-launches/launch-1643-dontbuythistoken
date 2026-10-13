@@ -5,6 +5,7 @@ import {PadLib} from "./libs/PadLib.sol";
 import {PadHook} from "./PadHook.sol";
 import {
     IPoolManager,
+    IPoolStateReader,
     IUnlockCallback,
     IPadToken,
     IPvPPad,
@@ -36,6 +37,11 @@ contract PadLiquidity is IUnlockCallback {
     uint256 public constant BURN_INTERVAL = 10 minutes;
     uint256 public constant SELL_CHUNK = 2_000_000 ether;
     uint256 internal constant LIQUIDITY_MARGIN_PPM = 1_000_000;
+    /// @notice Each protocol swap (burn buy, fee sale) is limited to this sqrt-price move from the
+    /// pre-swap spot: 0.5% in sqrt price, about 1% in price, below the 2% an attacker pays in pool
+    /// fees for a buy-and-sell round trip, so sandwiching a chunk cannot pay. Unfilled input stays.
+    uint256 public constant IMPACT_BPS = 50;
+    bytes32 internal constant POOLS_SLOT = bytes32(uint256(6));
 
     uint8 internal constant ACT_ADD = 1;
     uint8 internal constant ACT_COLLECT = 2;
@@ -97,7 +103,10 @@ contract PadLiquidity is IUnlockCallback {
         IPvPPad(pad_).bindLiquidity();
     }
 
-    receive() external payable {}
+    /// @dev Only the PoolManager pays ETH here (fee collection); everything else uses fundBurn/graduate.
+    receive() external payable {
+        require(msg.sender == address(poolManager), "not pool manager");
+    }
 
     function bindKing() external {
         require(king == address(0), "bound");
@@ -209,16 +218,35 @@ contract PadLiquidity is IUnlockCallback {
     }
 
     /// @notice Buys PvP with up to 0.02 ETH of the burn bucket and sends it to dEaD, once per 10 minutes.
+    /// The buy stops at a 1% price move; ETH not spent stays in the bucket for the next chunk.
     function burnChunk() external guard {
-        if (burnBucket == 0 || poolIndexOf[1] == 0) return;
+        uint256 gid = IPvPPad(pad).genesisId();
+        uint256 idx = gid == 0 ? 0 : poolIndexOf[gid];
+        if (burnBucket == 0 || idx == 0) return;
         if (block.timestamp < lastBurnAt + BURN_INTERVAL) return;
         uint256 amount = burnBucket > BURN_MAX ? BURN_MAX : burnBucket;
         burnBucket -= amount;
         lastBurnAt = uint64(block.timestamp);
-        totalBurnedEth += amount;
-        bytes memory res = poolManager.unlock(abi.encode(ACT_BURN, poolKey(pools[poolIndexOf[1] - 1].token), amount));
-        uint256 tokens = abi.decode(res, (uint256));
-        emit Burned(amount, tokens);
+        bytes memory res = poolManager.unlock(abi.encode(ACT_BURN, poolKey(pools[idx - 1].token), amount));
+        (uint256 spent, uint256 tokens) = abi.decode(res, (uint256, uint256));
+        if (spent < amount) burnBucket += amount - spent;
+        totalBurnedEth += spent;
+        emit Burned(spent, tokens);
+    }
+
+    /// @notice Current sqrt price of a pool, read from the PoolManager's storage (v4 StateLibrary layout).
+    function sqrtPriceOf(PoolKey memory key) public view returns (uint160) {
+        bytes32 slot = keccak256(abi.encodePacked(keccak256(abi.encode(key)), POOLS_SLOT));
+        return uint160(uint256(IPoolStateReader(address(poolManager)).extsload(slot)));
+    }
+
+    /// @dev Price limit `IMPACT_BPS` away from spot in the swap direction, kept inside the valid range.
+    function _priceLimit(PoolKey memory key, bool zeroForOne) internal view returns (uint160) {
+        uint256 spot = sqrtPriceOf(key);
+        uint256 limit = zeroForOne ? spot - spot * IMPACT_BPS / 10_000 : spot + spot * IMPACT_BPS / 10_000;
+        if (limit <= MIN_SQRT_PRICE_LIMIT) limit = MIN_SQRT_PRICE_LIMIT + 1;
+        if (limit >= MAX_SQRT_PRICE_LIMIT) limit = MAX_SQRT_PRICE_LIMIT - 1;
+        return uint160(limit);
     }
 
     function claim() external guard {
@@ -260,7 +288,7 @@ contract PadLiquidity is IUnlockCallback {
             uint256 sell = avail > SELL_CHUNK ? SELL_CHUNK : avail;
             uint256 ethFromSale;
             if (sell != 0) {
-                int256 d = poolManager.swap(key, SwapParams(false, -int256(sell), MAX_SQRT_PRICE_LIMIT), "");
+                int256 d = poolManager.swap(key, SwapParams(false, -int256(sell), _priceLimit(key, false)), "");
                 (int128 s0, int128 s1) = _split(d);
                 require(s1 <= 0, "swap sign");
                 uint256 tokIn = uint256(uint128(-s1));
@@ -275,13 +303,15 @@ contract PadLiquidity is IUnlockCallback {
         }
         if (action == ACT_BURN) {
             (, PoolKey memory key, uint256 amount) = abi.decode(data, (uint8, PoolKey, uint256));
-            int256 d = poolManager.swap(key, SwapParams(true, -int256(amount), MIN_SQRT_PRICE_LIMIT), "");
+            int256 d = poolManager.swap(key, SwapParams(true, -int256(amount), _priceLimit(key, true)), "");
             (int128 s0, int128 s1) = _split(d);
             require(s0 <= 0, "swap sign");
-            _settleEth(uint256(uint128(-s0)));
+            uint256 spent = uint256(uint128(-s0));
+            require(spent <= amount, "overspent");
+            _settleEth(spent);
             uint256 out = s1 > 0 ? uint256(uint128(s1)) : 0;
             if (out != 0) poolManager.take(key.currency1, DEAD, out);
-            return abi.encode(out);
+            return abi.encode(spent, out);
         }
         revert("bad action");
     }

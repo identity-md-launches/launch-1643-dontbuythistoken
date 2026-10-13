@@ -45,6 +45,11 @@ interface IPoolManager {
     function take(address currency, address to, uint256 amount) external;
 }
 
+/// @notice PoolManager storage reads (v4 Extsload); kept apart from IPoolManager so test stubs stay small.
+interface IPoolStateReader {
+    function extsload(bytes32 slot) external view returns (bytes32);
+}
+
 interface IUnlockCallback {
     function unlockCallback(bytes calldata data) external returns (bytes memory);
 }
@@ -82,6 +87,7 @@ interface IPvPPad {
     function upkeepFor(address caller) external;
     function fundCarry() external payable;
     function genesisGraduated() external view returns (bool);
+    function genesisId() external view returns (uint256);
     function launchCount() external view returns (uint256);
     function gameOf(uint256 id) external view returns (address);
     function tokenOf(uint256 id) external view returns (address);

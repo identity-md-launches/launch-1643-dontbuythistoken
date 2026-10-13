@@ -42,7 +42,10 @@ and contains no DELEGATECALL / CALLCODE / SELFDESTRUCT (clones are created at ru
 2. **Open the pad.** Call `PvPPad.openPad(salt)` from the owner. Anyone may call it 30 days after
    deployment (`openDeadline()`). It can only succeed once, cannot be undone and grants nothing else.
    Until then `mint`, `roll`, `launch` and `takeCrown` revert.
-3. There are no other settings. Fees, timings and sizes are constants (below).
+3. **Watch the genesis game.** Its first mint is free and anyone can make it. If it ends without a
+   single roll it is marked failed; call `PvPPad.restartGenesis()` (or just `launch(...)`, which does
+   the same while the genesis is failed) to relaunch PvP. Nothing else is needed.
+4. There are no other settings. Fees, timings and sizes are constants (below).
 
 ## Rules implemented
 
@@ -50,7 +53,8 @@ and contains no DELEGATECALL / CALLCODE / SELFDESTRUCT (clones are created at ru
   reverts with `hook flags` unless the address has exactly the beforeInitialize flag.
 - **Launch.** `launch(name<=32, ticker<=10, imageURL<=200)` by anyone after PvP graduates. 1e9
   supply minted to the game clone; transfers locked until graduation except by the game and
-  `PadLiquidity`; unlocked inside the graduation transaction.
+  `PadLiquidity`; unlocked inside the graduation transaction. While the current genesis is failed,
+  `launch()` relaunches PvP instead (same as `restartGenesis()`) and returns the new genesis id.
 - **Curve.** Virtual constant product, 1 ETH and 1e9 tokens virtual, 800M on the curve (sold out at
   exactly 4 ETH), 200M reserved for LP. Only rolls buy, no sells. Once sold out, the roll's 90% goes
   to the pot.
@@ -66,21 +70,28 @@ and contains no DELEGATECALL / CALLCODE / SELFDESTRUCT (clones are created at ru
 - **End.** Living Imps ranked by |height| desc, earlier `heightReachedAt` wins ties; top
   `ceil(living/2)` split 80% of the pot with triangular weights (`paid - rank`); bell ringer 20% (no
   bell: all to ranks; none living: carry pot for the next launch). Finalizer gets 0.5% of the pot,
-  max 0.005 ETH.
+  max 0.005 ETH, paid from roll income only. ETH the pad put into the pot (carry pot, king share;
+  `fundedPot`) is paid out only when at least 5 Imps are living at the end and at most 3x the
+  roll-earned pot (`rollPot()`); the rest returns to the carry pot. `fundPot` is pad-only.
 - **Graduation.** Permissionless after finalization: curve ETH + remaining tokens into a v4 pool
   (native ETH / token, fee 10000, tickSpacing 200, hooks = PadHook) initialized at the final curve
   price, full range (ticks ±887200), owned forever by `PadLiquidity`; excess tokens to `0x…dEaD`.
   No ETH raised: all tokens burned, launch marked failed.
 - **Genesis.** Launch #1 "Pepes Value Pepes" (PVP) is created in the last constructor and waits for
   its first mint. Its 2% burn share goes to its own pot. Other launches, the king and the burn wait
-  until PvP graduates. If genesis fails (no ETH raised) the pad stays closed to new launches: that is
-  the brief's gating and a known operational risk (see AUDIT).
+  until PvP graduates. If genesis fails (ended with no roll: token burned, `failed()`), anyone
+  relaunches PvP with `restartGenesis()`; `genesisId()` names the current genesis and the burn buys
+  the token of the genesis that graduated.
 - **Burn.** Burn-bucket ETH waits in `PadLiquidity`; after PvP graduates anyone or upkeep buys PVP
-  (max 0.02 ETH per buy, one buy per 10 minutes) straight to `0x…dEaD`.
+  (max 0.02 ETH per buy, one buy per 10 minutes) straight to `0x…dEaD`. Every protocol swap (burn
+  buy, fee sale) stops at a 0.5% sqrt-price move from spot (about 1% in price); the unfilled part
+  stays in the bucket or the token stash, so a chunk cannot be sandwiched profitably.
 - **King.** `takeCrown()` payable: first bid ≥ 0.01 ETH, then ≥ 110% of the current bid and only
   after the king held 1 hour. Old king refunded in full at once (push, claimable on failure). Extra
   (new − old; the whole first bid): 50% to pots of live games with ≥ 5 Imps among the last 10
-  launches, weighted by pot (none: carry pot), 25% burn bucket, 25% dev. `distribute(n)`: collect LP
+  launches, weighted by roll-earned pot (none: carry pot), 25% burn bucket, 25% dev. That share is
+  funded ETH inside the game and follows the funded-pot rule above. `takeCrown` runs upkeep with the
+  bidder as beneficiary of any finalizer fee. `distribute(n)`: collect LP
   fees from the next n pools round-robin, sell the token side (chunk-capped), send all to the king
   (escrowed while there is no king).
 - **Upkeep.** Every state-changing call runs bounded upkeep: resolve ≤ 8 rolls, one lifecycle step
@@ -99,6 +110,8 @@ and contains no DELEGATECALL / CALLCODE / SELFDESTRUCT (clones are created at ru
 | `SELL_CHUNK` | 2,000,000 tokens per fee collection | PadLiquidity |
 | `PadLib.PUSH_GAS` | 30,000 gas per ETH push | PadLib |
 | `KING_MAX_GAMES` / `KING_MIN_IMPS` | 10 / 5 | PvPPad |
+| `FUNDED_MIN_LIVING` / `FUNDED_RELEASE_MULTIPLE` | 5 living Imps / 3x the roll-earned pot to pay funded ETH out | PadGame |
+| `IMPACT_BPS` | 50 (0.5% sqrt price, about 1% price) max move per protocol swap | PadLiquidity |
 | `LIQUIDITY_MARGIN_PPM` | 1 ppm liquidity haircut so the manager never asks for more than held | PadLiquidity |
 | Wall-clock timing | `block.timestamp` for minutes/hours/days; ArbSys block numbers for the RNG commit window | PadGame |
 | Genesis name / ticker | "Pepes Value Pepes" / "PVP" | PvPPad |

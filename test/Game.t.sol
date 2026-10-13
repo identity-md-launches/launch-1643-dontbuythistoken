@@ -356,15 +356,47 @@ contract GameTest is BaseTest {
     }
 
     function test_finalizerFeeCapped() public {
+        mintAll(pvp, 5);
+        advance(10 minutes);
+        for (uint256 r; r < 7; ++r) {
+            for (uint256 i; i < 5; ++i) {
+                rollAs(pvp, players[i]);
+            }
+            advance(61);
+        }
+        assertGe(pvp.rollPot(), 0.005 ether, "roll pot covers the max fee");
+        vm.deal(address(pad), 10 ether);
+        vm.prank(address(pad));
+        pvp.fundPot{value: 5 ether}();
+        assertEq(pvp.fundedPot(), 5 ether);
+        advance(60 minutes);
+        uint256 carryBefore = pad.carryPot();
+        uint256 earned = pvp.rollPot();
+        vm.prank(players[9]);
+        pvp.finalize();
+        assertEq(players[9].balance, 10 ether + 0.005 ether);
+        // nobody living: funded ETH and the rest of the roll pot return to the carry
+        assertEq(pad.carryPot() - carryBefore, 5 ether + earned - 0.005 ether);
+    }
+
+    function test_finalizerFeeNeverExceedsRollPot() public {
         mintAll(pvp, 1);
         advance(10 minutes);
         rollAs(pvp, players[0]);
-        vm.deal(address(this), 10 ether);
+        uint256 earned = pvp.rollPot();
+        vm.deal(address(pad), 10 ether);
+        vm.prank(address(pad));
         pvp.fundPot{value: 5 ether}();
         advance(60 minutes);
         vm.prank(players[9]);
         pvp.finalize();
-        assertEq(players[9].balance, 10 ether + 0.005 ether);
+        assertEq(players[9].balance, 10 ether + earned, "fee comes out of roll income only");
+    }
+
+    function test_fundPotOnlyPad() public {
+        vm.deal(address(this), 1 ether);
+        vm.expectRevert(bytes("not pad"));
+        pvp.fundPot{value: 1 ether}();
     }
 
     function test_failedPushBecomesClaimable() public {
@@ -445,7 +477,8 @@ contract GameTest is BaseTest {
         uint160 sqrtP = pm.getPool(liq.poolKey(address(pvpToken))).sqrtPriceX96;
         (uint256 vEth, uint256 vTok,) = pvp.curveState();
         uint256 price = (uint256(sqrtP) * uint256(sqrtP)) >> 192;
-        assertApproxEqAbs(price, vTok / vEth, 1);
+        // the mock moves its price after the dust burn that upkeep ran inside graduate(): allow 0.01%
+        assertApproxEqRel(price, vTok / vEth, 1e14);
         // token now transferable
         uint256 bal = pvpToken.balanceOf(players[0]);
         uint256 other = pvpToken.balanceOf(players[1]);
@@ -489,6 +522,204 @@ contract GameTest is BaseTest {
         assertTrue(pvp.finalized());
         pad.upkeep();
         assertTrue(pvp.graduated());
+    }
+
+    // ---- funded pot (carry pot, king share) ------------------------------------------------------
+    function test_fundedPotReturnsToCarryWhenFewerThanFiveLive() public {
+        mintAll(pvp, 1);
+        vm.deal(address(pad), 10 ether);
+        vm.prank(address(pad));
+        pvp.fundPot{value: 0.5 ether}();
+        assertEq(pvp.pot(), 0.5 ether);
+        advance(10 minutes);
+        for (uint256 i; i < 6; ++i) {
+            rollAs(pvp, players[0]);
+            advance(599);
+        }
+        while (!pvp.ended()) advance(60);
+        advance(5);
+        uint256 carryBefore = pad.carryPot();
+        uint256 earned = pvp.rollPot();
+        vm.prank(players[0]);
+        pvp.finalize();
+        assertEq(pvp.livingAtEnd(), 1);
+        // the solo player gets back exactly its roll income (fee + rank), the funded 0.5 ETH returns
+        assertEq(players[0].balance, 10 ether - 6 * 0.002 ether + earned);
+        assertEq(pad.carryPot() - carryBefore, 0.5 ether);
+        assertEq(pvp.fundedPot(), 0);
+    }
+
+    function test_fundedPotReleasedToFiveLivingCappedAtThreeTimesRollPot() public {
+        mintAll(pvp, 5);
+        vm.deal(address(pad), 10 ether);
+        vm.prank(address(pad));
+        pvp.fundPot{value: 1 ether}();
+        advance(10 minutes);
+        for (uint256 i; i < 5; ++i) {
+            rollAs(pvp, players[i]);
+        }
+        advance(10 minutes); // all five die at endTime
+        uint256 earned = pvp.rollPot();
+        uint256 carryBefore = pad.carryPot();
+        uint256 mine = address(this).balance;
+        pvp.finalize();
+        assertEq(pvp.livingAtEnd(), 0);
+        // fee = min(0.5% of 1.001 ETH, 0.005 ETH, roll pot) = the whole roll pot; the funded ETH returns in full
+        assertEq(address(this).balance - mine, earned);
+        assertEq(pad.carryPot() - carryBefore, 1 ether);
+
+        // same setup with everyone alive at the end: 3x the roll pot is released, the rest returns
+        BaseTest.setUp();
+        openPad();
+        mintAll(pvp, 5);
+        vm.deal(address(pad), 10 ether);
+        vm.prank(address(pad));
+        pvp.fundPot{value: 1 ether}();
+        advance(10 minutes);
+        for (uint256 i; i < 5; ++i) {
+            rollAs(pvp, players[i]);
+        }
+        advance(61);
+        for (uint256 i; i < 5; ++i) {
+            rollAs(pvp, players[i]);
+        }
+        arb.advance(4);
+        pvp.poke();
+        // death is lastRoll + 10 min <= end, so end the game now with a bell by player 0: all five alive
+        _setBell(uint64(vm.getBlockTimestamp()), players[0]);
+        _setHeight(0, 50);
+        assertTrue(pvp.ended() && pvp.bellRang());
+        earned = pvp.rollPot();
+        carryBefore = pad.carryPot();
+        uint256 sum;
+        uint256[5] memory before;
+        for (uint256 i; i < 5; ++i) {
+            before[i] = players[i].balance;
+        }
+        vm.prank(players[9]);
+        pvp.finalize();
+        for (uint256 i; i < 5; ++i) {
+            sum += players[i].balance - before[i];
+        }
+        assertEq(pvp.livingAtEnd(), 5);
+        uint256 fee = (1 ether + earned) * 50 / 10_000;
+        if (fee > 0.005 ether) fee = 0.005 ether;
+        if (fee > earned) fee = earned;
+        uint256 returned = 1 ether - 3 * earned;
+        uint256 paidOut = 1 ether + earned - fee - returned;
+        uint256 carryGain = pad.carryPot() - carryBefore;
+        assertGe(carryGain, returned, "unreleased funded ETH returns to the carry (plus dust)");
+        assertLe(carryGain - returned, 10, "only rounding dust on top");
+        assertApproxEqAbs(sum, paidOut, 10, "players share roll pot plus 3x of it from the funded pot");
+        assertEq(players[9].balance, 10 ether + fee);
+    }
+
+    // ---- bell and tie-break details --------------------------------------------------------------
+    function test_rollAfterOwnBellReverts() public {
+        mintAll(pvp, 2);
+        advance(10 minutes);
+        rollAs(pvp, players[0]);
+        PadGame.Roll memory r = pvp.getRoll(0);
+        int256 d = _expectedDelta(address(pvp), 0, 0, r.commitBlock);
+        _setHeight(0, d > 0 ? int16(49) : int16(-49)); // the pending roll will ring the bell
+        advance(60);
+        uint256 rolls = pvp.rollCount();
+        vm.prank(players[0]);
+        vm.expectRevert(bytes("game over"));
+        pvp.roll{value: 0.002 ether}();
+        pvp.poke();
+        assertTrue(pvp.bellRang());
+        assertEq(pvp.rollCount(), rolls, "no roll recorded after the bell");
+        assertEq(pvp.pendingCount(), 0);
+    }
+
+    function test_deadImpCannotRingTheBell() public {
+        mintAll(pvp, 2);
+        advance(10 minutes);
+        rollAs(pvp, players[0]);
+        PadGame.Roll memory r = pvp.getRoll(0);
+        int256 d = _expectedDelta(address(pvp), 0, 0, r.commitBlock);
+        _setHeight(0, d > 0 ? int16(49) : int16(-49));
+        // player 1 keeps the game alive while the chain is quiet: only 2 L2 blocks in 9 minutes
+        vm.warp(vm.getBlockTimestamp() + 9 minutes);
+        arb.advance(2);
+        rollAs(pvp, players[1]);
+        assertEq(pvp.getImp(0).pendingRoll, 1, "player 0's roll is still pending");
+        vm.warp(vm.getBlockTimestamp() + 1 minutes + 1);
+        assertFalse(pvp.isAlive(0));
+        assertFalse(pvp.ended());
+        arb.advance(5);
+        pvp.resolvePending(8);
+        assertEq(pvp.getImp(0).pendingRoll, 0);
+        assertEq(PadGame(pvp).getImp(0).height, d > 0 ? int16(50) : int16(-50), "height still moves");
+        assertEq(pvp.bellAt(), 0, "a dead imp does not ring the bell");
+    }
+
+    function test_tieBreakFollowsCommitOrderNotResolutionOrder() public {
+        mintAll(pvp, 2);
+        advance(10 minutes);
+        rollAs(pvp, players[0]); // B: commits first
+        vm.warp(vm.getBlockTimestamp() + 1);
+        arb.advance(1); // next L2 block: B's roll is not resolvable yet
+        rollAs(pvp, players[1]); // A: commits second
+        PadGame.Roll memory r0 = pvp.getRoll(0);
+        PadGame.Roll memory r1 = pvp.getRoll(1);
+        int256 d0 = _expectedDelta(address(pvp), 0, 0, r0.commitBlock);
+        int256 d1 = _expectedDelta(address(pvp), 1, 0, r1.commitBlock);
+        _setHeight(0, int16(30 - d0)); // both land on +30
+        _setHeight(1, int16(30 - d1));
+        advance(60);
+        // A rolls again: its own pending roll resolves first, then the batch resolves B's
+        rollAs(pvp, players[1]);
+        assertEq(pvp.getImp(0).height, 30);
+        assertEq(pvp.getImp(0).heightReachedAt, r0.commitBlock, "stamped with the commit block");
+        assertEq(pvp.getImp(1).heightReachedAt, r1.commitBlock);
+        // let A's new roll resolve, then put A back on 30 with its original stamp so only the tie-break counts
+        advance(1);
+        pvp.resolvePending(8);
+        _setHeightAt(1, 30, uint40(r1.commitBlock));
+        _setBell(uint64(vm.getBlockTimestamp()), players[5]);
+        assertTrue(pvp.ended());
+        uint256 b0 = players[0].balance;
+        uint256 b1 = players[1].balance;
+        pvp.finalize();
+        assertEq(pvp.livingAtEnd(), 2);
+        assertEq(pvp.paidAtEnd(), 1);
+        assertGt(players[0].balance, b0, "B committed first and wins the tie");
+        assertEq(players[1].balance, b1);
+    }
+
+    function test_finalizeWith200LivingImpsStaysUnderFiveMillionGas() public {
+        address[] memory many = new address[](200);
+        for (uint256 i; i < 200; ++i) {
+            many[i] = address(uint160(0xB000 + i));
+            vm.deal(many[i], 1 ether);
+            vm.prank(many[i]);
+            pvp.mint();
+        }
+        advance(10 minutes);
+        for (uint256 i; i < 200; ++i) {
+            vm.prank(many[i]);
+            pvp.roll{value: 0.002 ether}();
+        }
+        advance(2);
+        pvp.resolvePending(300);
+        assertEq(pvp.pendingCount(), 0);
+        uint256 end = pvp.endTime();
+        // heights ascend with the index so every insertion walks to the front; all alive at the end
+        for (uint256 i; i < 200; ++i) {
+            uint256 word = uint256(uint160(many[i])) | (uint256(uint16(int16(int256(i / 4)))) << 160)
+                | (uint256(end - 1) << 176) | (uint256(1000 - i) << 216);
+            vm.store(address(pvp), _impSlot(i), bytes32(word));
+        }
+        vm.warp(end);
+        assertTrue(pvp.ended());
+        uint256 g = gasleft();
+        pvp.finalize();
+        g -= gasleft();
+        assertEq(pvp.livingAtEnd(), 200);
+        assertEq(pvp.paidAtEnd(), 100);
+        assertLt(g, 5_000_000, "200-imp finalize gas");
     }
 
     // ---- helpers ---------------------------------------------------------------------------------

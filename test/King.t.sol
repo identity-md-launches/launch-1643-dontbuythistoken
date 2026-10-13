@@ -4,7 +4,51 @@ pragma solidity 0.8.26;
 import {BaseTest} from "./Base.t.sol";
 import {PadToken} from "../src/PadToken.sol";
 import {PadGame} from "../src/PadGame.sol";
-import {Rejector} from "./mocks/Mocks.sol";
+import {Rejector, MockPoolManager} from "./mocks/Mocks.sol";
+import {IPoolManager, IUnlockCallback, PoolKey, SwapParams} from "../src/interfaces/Interfaces.sol";
+import {PvPPad} from "../src/PvPPad.sol";
+
+/// @notice Attacker that buys PVP, triggers the protocol's burn chunk, then sells back, all in one call.
+contract Sandwicher is IUnlockCallback {
+    MockPoolManager immutable pm;
+    PvPPad immutable pad;
+    PadToken immutable token;
+    PoolKey key;
+
+    constructor(MockPoolManager pm_, PvPPad pad_, PadToken token_, PoolKey memory key_) {
+        pm = pm_;
+        pad = pad_;
+        token = token_;
+        key = key_;
+    }
+
+    function attack(uint256 ethIn) external {
+        pm.unlock(abi.encode(true, ethIn));
+        pad.upkeep();
+        pm.unlock(abi.encode(false, token.balanceOf(address(this))));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        (bool zeroForOne, uint256 amountIn) = abi.decode(data, (bool, uint256));
+        int256 d = pm.swap(
+            key, SwapParams(zeroForOne, -int256(amountIn), zeroForOne ? 4_295_128_741 : type(uint160).max - 1), ""
+        );
+        int128 a0 = int128(d >> 128);
+        int128 a1 = int128(d);
+        if (zeroForOne) {
+            pm.settle{value: uint256(uint128(-a0))}();
+            pm.take(key.currency1, address(this), uint256(uint128(a1)));
+        } else {
+            pm.sync(key.currency1);
+            token.transfer(address(pm), uint256(uint128(-a1)));
+            pm.settle();
+            pm.take(address(0), address(this), uint256(uint128(a0)));
+        }
+        return "";
+    }
+
+    receive() external payable {}
+}
 
 contract KingTest is BaseTest {
     function setUp() public override {
@@ -75,14 +119,19 @@ contract KingTest is BaseTest {
         uint256 potA = ga.pot();
         uint256 potB = gb.pot();
         uint256 potC = gc.pot();
-        assertGt(potA, potB);
+        // A received the genesis carry at creation: the weight is the roll-earned pot, not the total
+        assertGt(ga.fundedPot(), 0);
+        uint256 rollA = ga.rollPot();
+        uint256 rollB = gb.rollPot();
+        assertGt(rollA, rollB);
         vm.prank(players[8]);
         king.takeCrown{value: 1 ether}();
         uint256 games = 0.5 ether;
-        uint256 total = potA + potB;
-        assertEq(ga.pot() - potA, games * potA / total);
-        assertEq(gb.pot() - potB, games - games * potA / total);
+        uint256 total = rollA + rollB;
+        assertEq(ga.pot() - potA, games * rollA / total);
+        assertEq(gb.pot() - potB, games - games * rollA / total);
         assertEq(gc.pot(), potC);
+        assertEq(ga.rollPot(), rollA, "king share is funded, not roll-earned");
     }
 
     function test_refundToRejectingKingIsClaimable() public {
@@ -129,7 +178,18 @@ contract KingTest is BaseTest {
         assertApproxEqAbs(players[8].balance, 10 ether - 0.01 ether + 0.1 ether, 1e9);
     }
 
+    /// @dev Deepen the PVP pool so a 0.02 ETH chunk moves the price by far less than 1%.
+    function deepenPvpPool(uint256 r0) internal {
+        PoolKey memory key = liq.poolKey(address(pvpToken));
+        MockPoolManager.PoolState memory ps = pm.getPool(key);
+        uint256 r1 = ps.reserve1 * r0 / ps.reserve0;
+        vm.deal(address(pm), address(pm).balance + r0);
+        deal(address(pvpToken), address(pm), pvpToken.balanceOf(address(pm)) + r1);
+        pm.fatten(key, r0, r1);
+    }
+
     function test_burnChunkBuysPvpToDeadEvery10Minutes() public {
+        deepenPvpPool(20 ether);
         vm.deal(address(this), 1 ether);
         vm.warp(vm.getBlockTimestamp() + 10 minutes); // upkeep already burned the graduation dust
         uint256 burnedBefore = liq.totalBurnedEth();
@@ -149,6 +209,68 @@ contract KingTest is BaseTest {
         vm.warp(vm.getBlockTimestamp() + 10 minutes);
         liq.burnChunk();
         assertEq(liq.burnBucket(), 0);
+    }
+
+    function test_burnChunkStopsAtOnePercentPriceMoveAndKeepsTheRest() public {
+        // thin pool (genesis raised about 0.02 ETH): a 0.02 ETH chunk would nearly double the price
+        PoolKey memory key = liq.poolKey(address(pvpToken));
+        uint160 before = liq.sqrtPriceOf(key);
+        assertEq(before, pm.getPool(key).sqrtPriceX96, "extsload reads slot0");
+        vm.deal(address(this), 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        liq.fundBurn{value: 0.02 ether}();
+        uint256 bucket = liq.burnBucket();
+        uint256 burnedBefore = liq.totalBurnedEth();
+        liq.burnChunk();
+        uint256 spent = liq.totalBurnedEth() - burnedBefore;
+        assertGt(spent, 0, "a partial buy happened");
+        assertLt(spent, 0.002 ether, "the thin pool caps the fill");
+        assertEq(liq.burnBucket(), bucket - spent, "unspent ETH stays in the bucket");
+        uint160 after_ = liq.sqrtPriceOf(key);
+        assertLt(after_, before);
+        assertGe(uint256(after_) * 10_000, uint256(before) * 9_950, "sqrt price moved at most 0.5%");
+    }
+
+    function test_sandwichOnBurnChunkDoesNotPay() public {
+        PoolKey memory key = liq.poolKey(address(pvpToken));
+        Sandwicher atk = new Sandwicher(pm, pad, pvpToken, key);
+        vm.deal(address(atk), 1 ether);
+        vm.deal(address(this), 1 ether);
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        liq.fundBurn{value: 0.02 ether}();
+        uint256 burnedBefore = liq.totalBurnedEth();
+        atk.attack(0.01 ether);
+        assertGt(liq.totalBurnedEth(), burnedBefore, "the chunk ran inside the sandwich");
+        assertLt(address(atk).balance, 1 ether, "the attacker loses the pool fees on the round trip");
+        assertEq(pvpToken.balanceOf(address(atk)), 0);
+    }
+
+    function test_takeCrownUpkeepPaysFinalizerFeeToBidder() public {
+        uint256 id = pad.launch("Foo", "FOO", "");
+        PadGame g = PadGame(pad.gameOf(id));
+        mintAll(g, 3);
+        advance(10 minutes);
+        for (uint256 i; i < 3; ++i) {
+            rollAs(g, players[i]);
+        }
+        advance(60 minutes);
+        assertTrue(g.ended() && !g.finalized());
+        uint256 fee = g.pot() * 50 / 10_000;
+        assertGt(fee, 0);
+        uint256 before = players[7].balance;
+        vm.prank(players[7]);
+        king.takeCrown{value: 0.01 ether}();
+        assertTrue(g.finalized(), "upkeep finalized the due game");
+        assertEq(g.claimable(address(king)), 0, "nothing stranded on the king contract");
+        // the bidder also receives, as the new king, the LP fees that the same upkeep distributed
+        assertGe(players[7].balance, before - 0.01 ether + fee, "the bidder gets the finalizer fee");
+    }
+
+    function test_upkeepForAcceptsKingContract() public {
+        vm.prank(address(king));
+        pad.upkeepFor(players[0]);
+        vm.expectRevert(bytes("not game"));
+        pad.upkeepFor(players[0]);
     }
 
     function test_burnWaitsForPvpGraduation() public {

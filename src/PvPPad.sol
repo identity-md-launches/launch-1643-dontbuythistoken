@@ -13,6 +13,8 @@ contract PvPPad {
     uint256 public constant MAX_URL = 200;
     uint256 public constant KING_MAX_GAMES = 10;
     uint256 public constant KING_MIN_IMPS = 5;
+    string internal constant GENESIS_NAME = "Pepes Value Pepes";
+    string internal constant GENESIS_TICKER = "PVP";
     uint160 internal constant HOOK_MASK = (1 << 14) - 1;
     uint160 internal constant BEFORE_INITIALIZE_FLAG = 1 << 13;
 
@@ -38,6 +40,8 @@ contract PvPPad {
     address public hook;
     uint256 public carryPot;
     uint256 public upkeepCursor;
+    /// @notice Launch id of the current genesis (PvP). A failed genesis is replaced by a new one.
+    uint256 public genesisId;
     bool private locked;
 
     Launch[] internal launches;
@@ -52,6 +56,7 @@ contract PvPPad {
     event CarryFunded(address indexed from, uint256 amount);
     event CarryPaid(uint256 indexed id, uint256 amount);
     event GamesFunded(uint256 amount, uint256 games);
+    event GenesisRestarted(uint256 indexed id, uint256 indexed failedId, address indexed by);
 
     constructor(address owner_, address tokenTemplate_, address gameTemplate_) {
         require(owner_ != address(0) && tokenTemplate_ != address(0) && gameTemplate_ != address(0), "zero");
@@ -74,7 +79,20 @@ contract PvPPad {
         require(liquidity != address(0), "no liquidity");
         king = msg.sender;
         emit KingBound(msg.sender);
-        _create("Pepes Value Pepes", "PVP", "", owner, true);
+        genesisId = _create(GENESIS_NAME, GENESIS_TICKER, "", owner, true);
+    }
+
+    /// @notice A genesis game that ended without a single roll is marked failed and its token burned.
+    /// Anyone may then relaunch PvP so the pad is never locked: the new launch becomes the genesis
+    /// that other launches, the king and the burn wait for. `launch()` does the same when it finds
+    /// the genesis failed.
+    function restartGenesis() public returns (uint256 id) {
+        require(opened, "pad not open");
+        require(genesisFailed(), "genesis not failed");
+        uint256 failedId = genesisId;
+        id = _create(GENESIS_NAME, GENESIS_TICKER, "", owner, true);
+        genesisId = id;
+        emit GenesisRestarted(id, failedId, msg.sender);
     }
 
     // ---- open switch ---------------------------------------------------------------------------
@@ -94,16 +112,23 @@ contract PvPPad {
     }
 
     // ---- launches --------------------------------------------------------------------------------
+    /// @notice Creates a launch once PvP has graduated. If the current genesis failed (ended with no
+    /// roll), the call relaunches PvP instead and returns the new genesis id; the requested launch is
+    /// not created until that genesis graduates. Check `genesisGraduated()` / `genesisFailed()` first.
     function launch(string calldata name, string calldata ticker, string calldata imageURL)
         external
         returns (uint256 id)
     {
         require(opened, "pad not open");
-        require(genesisGraduated(), "genesis not graduated");
         require(bytes(name).length != 0 && bytes(name).length <= MAX_NAME, "name");
         require(bytes(ticker).length != 0 && bytes(ticker).length <= MAX_TICKER, "ticker");
         require(bytes(imageURL).length <= MAX_URL, "url");
-        id = _create(name, ticker, imageURL, msg.sender, false);
+        if (genesisFailed()) {
+            id = restartGenesis();
+        } else {
+            require(genesisGraduated(), "genesis not graduated");
+            id = _create(name, ticker, imageURL, msg.sender, false);
+        }
         upkeep();
     }
 
@@ -134,7 +159,9 @@ contract PvPPad {
     }
 
     /// @notice King's 50% share: pots of live games with >= 5 Imps among the last 10 launches, weighted
-    /// by pot size (equal split when every pot is empty); none live: carry pot.
+    /// by roll-earned pot size (equal split when every pot is empty); none live: carry pot. Each game
+    /// pays funded ETH out only with >= 5 living Imps at its end and at most 3x its roll-earned pot;
+    /// the rest returns here as carry.
     function fundGames() external payable {
         require(msg.sender == king, "not king");
         uint256 n = launches.length;
@@ -172,9 +199,10 @@ contract PvPPad {
         _upkeep(msg.sender);
     }
 
-    /// @notice Games call this so the finalizer fee of upkeep work goes to their caller, not the game.
+    /// @notice Games and the king contract call this so the finalizer fee of upkeep work goes to their
+    /// caller, not to the contract.
     function upkeepFor(address caller) external {
-        require(isGame[msg.sender], "not game");
+        require(isGame[msg.sender] || msg.sender == king, "not game");
         _upkeep(caller);
     }
 
@@ -201,9 +229,14 @@ contract PvPPad {
 
     // ---- views -----------------------------------------------------------------------------------
     function genesisGraduated() public view returns (bool) {
-        if (launches.length == 0) return false;
-        IPadGame g = IPadGame(launches[0].game);
+        if (genesisId == 0) return false;
+        IPadGame g = IPadGame(launches[genesisId - 1].game);
         return g.graduated() && !g.failed();
+    }
+
+    function genesisFailed() public view returns (bool) {
+        if (genesisId == 0) return false;
+        return IPadGame(launches[genesisId - 1].game).failed();
     }
 
     function launchCount() external view returns (uint256) {

@@ -180,6 +180,66 @@ contract PadTest is BaseTest {
         assertFalse(PadGame(l.game).genesis());
     }
 
+    function test_failedGenesisIsRestartedByLaunchAndThePadRecovers() public {
+        openPad();
+        // a stranger mints one free Imp, then nobody rolls: the genesis game fails
+        vm.prank(address(0xBAD));
+        pvp.mint();
+        vm.warp(vm.getBlockTimestamp() + 20 minutes);
+        pvp.poke();
+        pvp.poke();
+        assertTrue(pvp.failed());
+        assertTrue(pad.genesisFailed());
+        assertFalse(pad.genesisGraduated());
+        vm.expectRevert(bytes("king not open"));
+        king.takeCrown{value: 0.01 ether}();
+        // launch() relaunches PvP instead of creating "Next"
+        vm.prank(players[0]);
+        uint256 id = pad.launch("Next", "NXT", "");
+        assertEq(id, 2);
+        assertEq(pad.genesisId(), 2);
+        assertEq(pad.launchCount(), 2);
+        PvPPad.Launch memory l = pad.getLaunch(2);
+        assertEq(l.name, "Pepes Value Pepes");
+        assertEq(PadToken(l.token).symbol(), "PVP");
+        assertTrue(PadGame(l.game).genesis());
+        assertFalse(pad.genesisFailed());
+        // the new genesis gates everything again until it graduates
+        vm.expectRevert(bytes("genesis not graduated"));
+        pad.launch("Next", "NXT", "");
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+        PadGame pvp2 = PadGame(l.game);
+        playOut(pvp2, 4, 3);
+        if (!pvp2.graduated()) pvp2.graduate();
+        assertTrue(pad.genesisGraduated());
+        // now ordinary launches, the king and the burn (on the new PVP pool) work
+        vm.prank(players[0]);
+        uint256 id3 = pad.launch("Next", "NXT", "");
+        assertEq(id3, 3);
+        assertEq(pad.getLaunch(3).name, "Next");
+        vm.prank(players[1]);
+        king.takeCrown{value: 0.01 ether}();
+        assertEq(liq.poolIndexOf(2), 1, "PVP #2 has the pool");
+        vm.warp(vm.getBlockTimestamp() + 10 minutes);
+        uint256 burnedBefore = liq.totalBurnedEth();
+        liq.burnChunk();
+        assertGt(liq.totalBurnedEth(), burnedBefore, "burn buys the new PVP");
+        assertGt(PadToken(l.token).balanceOf(DEAD), 0);
+    }
+
+    function test_restartGenesisRevertsWhileGenesisWaitsOrPlays() public {
+        vm.expectRevert(bytes("pad not open"));
+        pad.restartGenesis();
+        openPad();
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+        vm.prank(players[0]);
+        pvp.mint();
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+    }
+
     function test_launchValidatesStrings() public {
         graduatePvp();
         vm.expectRevert(bytes("name"));
