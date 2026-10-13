@@ -122,16 +122,35 @@ contract AdversarialTest is BaseTest {
     }
 
     // ---- genesis gating ---------------------------------------------------------------------------
-    function test_failedGenesisLocksLaunchKingAndBurnForever() public {
+    function test_failedGenesisKeepsKingAndBurnClosedAndLaunchOnlyRelaunchesPvp() public {
         openPad();
         mintAll(pvp, 1);
         advance(20 minutes); // nobody rolled: all dead, nothing raised
         pvp.finalize();
         pvp.graduate();
         assertTrue(pvp.failed());
+        assertTrue(pad.genesisFailed());
         assertFalse(pad.genesisGraduated());
+        // launch() does not create "Foo": it relaunches PvP and hands back the new genesis id
+        vm.prank(players[3]);
+        uint256 id = pad.launch("Foo", "FOO", "ipfs://foo");
+        assertEq(id, 2);
+        assertEq(pad.genesisId(), 2);
+        assertEq(pad.launchCount(), 2, "exactly one launch was created");
+        PvPPad.Launch memory l = pad.getLaunch(2);
+        assertEq(l.name, "Pepes Value Pepes");
+        assertEq(l.ticker, "PVP");
+        assertEq(l.imageURL, "");
+        assertEq(l.creator, OWNER, "the relaunch belongs to the owner, not the caller");
+        assertTrue(PadGame(l.game).genesis());
+        assertFalse(pad.genesisFailed());
+        assertFalse(pad.genesisGraduated());
+        // the new genesis is waiting: ordinary launches and a second restart are refused
         vm.expectRevert(bytes("genesis not graduated"));
         pad.launch("Foo", "FOO", "");
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+        // king and burn stay closed until a PvP graduates
         vm.prank(players[0]);
         vm.expectRevert(bytes("king not open"));
         king.takeCrown{value: 1 ether}();
@@ -141,6 +160,37 @@ contract AdversarialTest is BaseTest {
         liq.burnChunk();
         assertEq(liq.totalBurnedEth(), 0, "no PvP pool: nothing to buy");
         assertEq(liq.burnBucket(), 0.5 ether);
+    }
+
+    function test_restartGenesisNeedsOpenPadAndFailedGenesis() public {
+        vm.expectRevert(bytes("pad not open"));
+        pad.restartGenesis();
+        openPad();
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+        graduatePvp();
+        vm.expectRevert(bytes("genesis not failed"));
+        pad.restartGenesis();
+        assertEq(pad.genesisId(), 1, "a graduated genesis is never replaced");
+    }
+
+    function test_failedGenesisRelaunchTakesTheCarryPotAsFundedEth() public {
+        openPad();
+        mintAll(pvp, 1);
+        advance(20 minutes);
+        pvp.finalize();
+        pvp.graduate();
+        vm.deal(address(this), 1 ether);
+        pad.fundCarry{value: 0.3 ether}();
+        uint256 id = pad.restartGenesis();
+        PadGame g = PadGame(pad.gameOf(id));
+        assertEq(pad.carryPot(), 0);
+        assertEq(g.pot(), 0.3 ether);
+        assertEq(g.fundedPot(), 0.3 ether, "carry is funded ETH, not roll income");
+        assertEq(g.rollPot(), 0);
+        (bool live, uint256 weight) = g.isLiveForKing();
+        assertFalse(live);
+        assertEq(weight, 0, "funded ETH never weighs in the king split");
     }
 
     function test_mintOnFreshLaunchBeforeItsOwnFirstMintIsStatusZero() public {
@@ -376,14 +426,25 @@ contract AdversarialTest is BaseTest {
         assertEq(players[1].balance - before, p - p * 50 / 10_000);
     }
 
-    function test_fundPotRefusedAfterFinalize() public {
+    function test_fundPotRefusedFromStrangersAndAfterFinalize() public {
         openPad();
+        vm.deal(address(this), 1 ether);
+        vm.expectRevert(bytes("not pad"));
+        pvp.fundPot{value: 1}();
+        vm.prank(OWNER);
+        vm.expectRevert(bytes("not pad"));
+        pvp.fundPot{value: 0}();
+        vm.prank(address(king));
+        vm.expectRevert(bytes("not pad"));
+        pvp.fundPot{value: 0}();
         mintAll(pvp, 1);
         advance(20 minutes);
         pvp.finalize();
-        vm.deal(address(this), 1 ether);
+        vm.deal(address(pad), 1 ether);
+        vm.prank(address(pad));
         vm.expectRevert(bytes("finalized"));
         pvp.fundPot{value: 1}();
+        assertEq(pvp.fundedPot(), 0);
     }
 
     function test_claimNothingReverts() public {
@@ -507,12 +568,17 @@ contract AdversarialTest is BaseTest {
         PadGame gb = PadGame(pad.gameOf(b));
         mintAll(ga, 5);
         mintAll(gb, 6);
-        _zeroPot(ga);
-        _zeroPot(gb);
+        // launch A took the carry pot as funded ETH; neither game has roll income, so the weights are 0/0
+        uint256 fundedA = ga.fundedPot();
+        assertEq(ga.rollPot() + gb.rollPot(), 0);
+        assertEq(gb.fundedPot(), 0);
         vm.prank(players[8]);
         king.takeCrown{value: 1 ether}();
-        assertEq(ga.pot(), 0.25 ether);
+        assertEq(ga.fundedPot() - fundedA, 0.25 ether);
+        assertEq(gb.fundedPot(), 0.25 ether);
+        assertEq(ga.pot(), fundedA + 0.25 ether);
         assertEq(gb.pot(), 0.25 ether);
+        assertEq(ga.rollPot() + gb.rollPot(), 0, "the king share is funded ETH, never roll income");
     }
 
     function test_fundGamesOnlyLooksAtLastTenLaunches() public {
@@ -521,14 +587,34 @@ contract AdversarialTest is BaseTest {
         for (uint256 i; i < 11; ++i) {
             games[i] = PadGame(pad.gameOf(pad.launch("G", "G", "")));
             mintAll(games[i], 5);
-            _zeroPot(games[i]);
         }
+        uint256 funded0 = games[0].fundedPot(); // the carry pot went to the first of them
         vm.prank(players[8]);
         king.takeCrown{value: 1 ether}();
-        assertEq(games[0].pot(), 0, "launch #2 is outside the last ten");
+        assertEq(games[0].fundedPot(), funded0, "launch #2 is outside the last ten");
         for (uint256 i = 1; i < 11; ++i) {
+            assertEq(games[i].fundedPot(), 0.05 ether);
             assertEq(games[i].pot(), 0.05 ether);
         }
+    }
+
+    function test_fundGamesSkipsGamesWithFewerThanFiveImpsAndEndedOnes() public {
+        graduatePvp();
+        PadGame small = PadGame(pad.gameOf(pad.launch("S", "S", "")));
+        PadGame done = PadGame(pad.gameOf(pad.launch("D", "D", "")));
+        PadGame live = PadGame(pad.gameOf(pad.launch("L", "L", "")));
+        mintAll(small, 4);
+        mintAll(done, 5);
+        advance(20 minutes); // `done` ends with every Imp dead; `small` ends too
+        mintAll(live, 5);
+        uint256 fundedSmall = small.fundedPot();
+        uint256 fundedDone = done.fundedPot();
+        vm.prank(players[8]);
+        king.takeCrown{value: 1 ether}();
+        assertEq(live.fundedPot(), 0.5 ether, "the only live game with five Imps takes the whole share");
+        // upkeep inside takeCrown may finalize an ended game (funded returns to carry); it never adds
+        assertLe(small.fundedPot(), fundedSmall);
+        assertLe(done.fundedPot(), fundedDone);
     }
 
     function test_crownEventAndSameKingMayRebid() public {
@@ -679,13 +765,6 @@ contract AdversarialTest is BaseTest {
         vm.store(address(g), bytes32(uint256(5)), bytes32(vEth - 1 ether));
         vm.store(address(g), bytes32(uint256(6)), bytes32(sold));
         assertEq(g.tokensSold(), sold);
-    }
-
-    function _zeroPot(PadGame g) internal {
-        uint256 p = g.pot();
-        vm.store(address(g), bytes32(uint256(7)), bytes32(0));
-        vm.deal(address(g), address(g).balance - p);
-        assertEq(g.pot(), 0);
     }
 
     function _impSlot(uint256 i) internal pure returns (bytes32) {

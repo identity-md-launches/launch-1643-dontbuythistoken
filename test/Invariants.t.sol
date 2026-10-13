@@ -29,6 +29,7 @@ contract PadHandler is Test {
     uint256 public successfulLaunches;
     uint256 public successfulFinalizes;
     uint256 public successfulGraduations;
+    uint256 public successfulRestarts;
 
     mapping(address => bool) public ghostEnded;
     mapping(address => bool) public ghostFinalized;
@@ -144,13 +145,45 @@ contract PadHandler is Test {
         _after();
     }
 
+    /// @dev Nobody but the pad may top up a pot: a donation from any actor (players, dev, the king
+    /// contract's address is not an actor) must be refused whatever the game's state.
     function fundPot(uint256 a, uint256 g, uint256 amount) external {
         amount = bound(amount, 0, 0.5 ether);
         address who = _actor(a);
         if (who.balance < amount) return;
         PadGame game = _game(g);
+        uint256 potBefore = game.pot();
+        uint256 fundedBefore = game.fundedPot();
         vm.prank(who);
-        try game.fundPot{value: amount}() {} catch {}
+        try game.fundPot{value: amount}() {
+            assertTrue(false, "stranger funded a pot");
+        } catch Error(string memory reason) {
+            assertEq(reason, "not pad");
+        }
+        assertEq(game.pot(), potBefore);
+        assertEq(game.fundedPot(), fundedBefore);
+        _after();
+    }
+
+    /// @dev Restarting the genesis succeeds exactly when the current genesis has failed.
+    function restartGenesis(uint256 a) external {
+        bool failedBefore = pad.genesisFailed();
+        uint256 oldId = pad.genesisId();
+        uint256 count = pad.launchCount();
+        uint256 carry = pad.carryPot();
+        vm.prank(_actor(a));
+        try pad.restartGenesis() returns (uint256 id) {
+            assertTrue(failedBefore, "restart without a failed genesis");
+            successfulRestarts += 1;
+            assertEq(id, count + 1);
+            assertEq(pad.genesisId(), id);
+            assertTrue(PadGame(pad.gameOf(id)).genesis());
+            assertEq(PadGame(pad.gameOf(id)).fundedPot(), carry, "carry pot moves into the new genesis");
+            assertEq(pad.carryPot(), 0);
+        } catch {
+            assertFalse(failedBefore, "failed genesis could not be restarted");
+            assertEq(pad.genesisId(), oldId);
+        }
         _after();
     }
 
@@ -199,12 +232,26 @@ contract PadHandler is Test {
     function launch(uint256 a, uint256 seed) external {
         address who = _actor(a);
         bool genesisOk = pad.genesisGraduated();
+        bool genesisFailed = pad.genesisFailed();
         vm.prank(who);
         try pad.launch(seed % 2 == 0 ? "Alpha" : "Beta", "T", "") returns (uint256 id) {
-            successfulLaunches += 1;
-            assertTrue(genesisOk && pad.opened(), "launch gate");
+            assertTrue(pad.opened(), "launch gate");
             assertEq(id, pad.launchCount());
-        } catch {}
+            if (genesisFailed) {
+                // a failed genesis turns launch() into a PvP relaunch; the requested launch is not made
+                successfulRestarts += 1;
+                assertEq(pad.genesisId(), id);
+                assertTrue(PadGame(pad.gameOf(id)).genesis());
+                assertEq(pad.getLaunch(id).creator, pad.owner());
+            } else {
+                successfulLaunches += 1;
+                assertTrue(genesisOk, "launch without graduated genesis");
+                assertFalse(PadGame(pad.gameOf(id)).genesis());
+                assertEq(pad.getLaunch(id).creator, who);
+            }
+        } catch {
+            assertFalse(genesisOk || genesisFailed, "launch refused although the gate was open");
+        }
         _after();
     }
 
@@ -336,10 +383,11 @@ contract InvariantTest is BaseTest {
         sels[17] = PadHandler.distribute.selector;
         sels[18] = PadHandler.creditFees.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: sels}));
-        bytes4[] memory more = new bytes4[](3);
+        bytes4[] memory more = new bytes4[](4);
         more[0] = PadHandler.burnChunk.selector;
         more[1] = PadHandler.fundBurn.selector;
         more[2] = PadHandler.tokenTransfer.selector;
+        more[3] = PadHandler.restartGenesis.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: more}));
     }
 
@@ -447,7 +495,21 @@ contract InvariantTest is BaseTest {
     }
 
     function invariant_genesisGatesLaunchesAndKing() public view {
-        if (pad.launchCount() > 1) assertTrue(pad.genesisGraduated(), "launch without graduated genesis");
+        uint256 gid = pad.genesisId();
+        assertTrue(gid >= 1 && gid <= pad.launchCount(), "genesis id out of range");
+        assertTrue(PadGame(pad.gameOf(gid)).genesis(), "current genesis is not a genesis game");
+        uint256 n = pad.launchCount();
+        for (uint256 i = 1; i <= n; ++i) {
+            PadGame g = PadGame(pad.gameOf(i));
+            if (g.genesis()) {
+                // every genesis but the current one is a failed one that was replaced
+                if (i != gid) assertTrue(g.failed(), "replaced genesis that did not fail");
+                assertEq(pad.getLaunch(i).creator, pad.owner(), "genesis belongs to the owner");
+            } else {
+                assertTrue(pad.genesisGraduated(), "launch without graduated genesis");
+            }
+        }
+        if (pad.genesisGraduated()) assertFalse(pad.genesisFailed(), "graduated genesis reads as failed");
         if (king.king() != address(0)) {
             assertTrue(pad.genesisGraduated(), "king without graduated genesis");
             assertGe(king.bid(), 0.01 ether);
@@ -456,9 +518,25 @@ contract InvariantTest is BaseTest {
         assertTrue(pad.opened());
     }
 
+    /// @notice Funded ETH (carry pot, king share) is always a part of the pot, never roll income, and
+    /// is gone once the game is finalized.
+    function invariant_fundedPotIsPartOfPotAndClearedByFinalize() public view {
+        uint256 n = pad.launchCount();
+        for (uint256 i = 1; i <= n; ++i) {
+            PadGame g = PadGame(pad.gameOf(i));
+            assertLe(g.fundedPot(), g.pot(), "funded above the pot");
+            assertEq(g.rollPot(), g.pot() - g.fundedPot());
+            (, uint256 weight) = g.isLiveForKing();
+            assertEq(weight, g.rollPot(), "king weight is the roll income");
+            if (g.finalized()) assertEq(g.fundedPot(), 0, "funded left after finalize");
+            if (g.impCount() == 0 || g.rollCount() == 0) assertEq(g.rollPot(), 0, "roll income without a roll");
+        }
+    }
+
     function invariant_callSummary() public view {
         // informational: keeps the run honest about what the handler actually reached
-        assertLe(handler.successfulLaunches(), pad.launchCount());
+        // the initial genesis plus every launch and relaunch the handler saw succeed is the whole registry
+        assertEq(1 + handler.successfulLaunches() + handler.successfulRestarts(), pad.launchCount());
     }
 
     // ---- helpers ---------------------------------------------------------------------------------

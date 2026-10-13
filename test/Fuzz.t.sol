@@ -166,8 +166,12 @@ contract FuzzTest is BaseTest {
         }
         arb.advance(4);
         pvp.resolvePending(16);
-        vm.deal(address(this), extraPot);
-        if (extraPot != 0) pvp.fundPot{value: extraPot}();
+        // funded ETH (carry pot / king share) only ever arrives from the pad
+        vm.deal(address(pad), extraPot);
+        if (extraPot != 0) {
+            vm.prank(address(pad));
+            pvp.fundPot{value: extraPot}();
+        }
         // distinct heights: imp i sits at height n - i, so imp 0 ranks first
         for (uint256 i; i < n; ++i) {
             _setHeightAt(pvp, i, int16(int256(n - i)), 1);
@@ -175,6 +179,11 @@ contract FuzzTest is BaseTest {
         advance(5 minutes);
         assertTrue(pvp.ended());
         uint256 p = pvp.pot();
+        uint256 funded = pvp.fundedPot();
+        uint256 earned = pvp.rollPot();
+        assertEq(funded, extraPot);
+        assertEq(earned + funded, p);
+        assertEq(earned, n * 6 * 0.0002 ether, "genesis: 10% of every roll is roll income");
         uint256[] memory before = new uint256[](n);
         for (uint256 i; i < n; ++i) {
             before[i] = players[i].balance;
@@ -183,9 +192,15 @@ contract FuzzTest is BaseTest {
         uint256 finalizerBefore = players[11].balance;
         vm.prank(players[11]);
         pvp.finalize();
+        // finalizer: 0.5% of the whole pot, max 0.005 ETH, never more than the roll income
         uint256 fee = p * 50 / 10_000;
         if (fee > 0.005 ether) fee = 0.005 ether;
-        uint256 ranks = p - fee;
+        if (fee > earned) fee = earned;
+        // funded ETH: all returned with fewer than five living, otherwise the part above 3x roll income
+        uint256 returned;
+        if (n < 5) returned = funded;
+        else if (funded > earned * 3) returned = funded - earned * 3;
+        uint256 ranks = p - fee - returned;
         uint256 paid = (n + 1) / 2;
         uint256 weightSum = paid * (paid + 1) / 2;
         uint256 sent;
@@ -195,9 +210,63 @@ contract FuzzTest is BaseTest {
             sent += expect;
         }
         assertEq(players[11].balance - finalizerBefore, fee);
-        assertEq(pad.carryPot() - carryBefore, ranks - sent, "dust to carry");
+        assertEq(pad.carryPot() - carryBefore, returned + (ranks - sent), "returned funded ETH and dust to carry");
         assertEq(pvp.pot(), 0);
+        assertEq(pvp.fundedPot(), 0);
         assertEq(address(pvp).balance, pvp.ethRaised());
+        assertLe(sent + fee, earned + (n < 5 ? 0 : earned * 3), "players and finalizer never get above 4x roll income");
+    }
+
+    /// @notice The funded-pot gate: with every Imp alive, the amount released never exceeds 3x the
+    /// roll income, and nothing of it is released below five living Imps.
+    /// forge-config: default.fuzz.runs = 64
+    function testFuzz_fundedReleaseNeverExceedsThreeTimesRollIncome(uint8 nRaw, uint256 funded, uint8 rollsRaw) public {
+        uint256 n = bound(nRaw, 1, 8);
+        uint256 rounds = bound(rollsRaw, 1, 3);
+        funded = bound(funded, 1, 5 ether);
+        openPad();
+        mintAll(pvp, n);
+        advance(10 minutes);
+        for (uint256 k; k < rounds; ++k) {
+            for (uint256 i; i < n; ++i) {
+                rollAs(pvp, players[i]);
+            }
+            advance(61);
+        }
+        vm.deal(address(pad), funded);
+        vm.prank(address(pad));
+        pvp.fundPot{value: funded}();
+        // bell now: every Imp rolled within the last 10 minutes, so all n are alive at the end
+        _setBell(pvp, uint64(vm.getBlockTimestamp()), players[0]);
+        arb.advance(4);
+        pvp.resolvePending(64);
+        uint256 earned = pvp.rollPot();
+        uint256 carryBefore = pad.carryPot();
+        uint256 playersBefore;
+        for (uint256 i; i < n; ++i) {
+            playersBefore += players[i].balance;
+        }
+        vm.prank(players[11]);
+        pvp.finalize();
+        assertEq(pvp.livingAtEnd(), n);
+        uint256 playersAfter;
+        for (uint256 i; i < n; ++i) {
+            playersAfter += players[i].balance;
+        }
+        uint256 released = n < 5 ? 0 : (funded > earned * 3 ? earned * 3 : funded);
+        uint256 returned = funded - released;
+        uint256 toPlayers = playersAfter - playersBefore;
+        uint256 toCarry = pad.carryPot() - carryBefore;
+        assertGe(toCarry, returned, "unreleased funded ETH returns to the carry");
+        assertLe(toPlayers, earned + released, "players never get more than roll income plus the release");
+        assertEq(toPlayers + toCarry + (players[11].balance - 10 ether), earned + funded, "nothing leaks");
+    }
+
+    function _setBell(PadGame g, uint64 at, address ringer) internal {
+        uint256 word = uint256(g.firstMintAt()) | (uint256(at) << 64) | (uint256(g.maxActivity()) << 128);
+        vm.store(address(g), bytes32(uint256(8)), bytes32(word));
+        vm.store(address(g), bytes32(uint256(9)), bytes32(uint256(uint160(ringer))));
+        assertEq(g.bellAt(), at, "bell set");
     }
 
     // ---- helpers ----------------------------------------------------------------------------
