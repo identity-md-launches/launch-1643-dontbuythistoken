@@ -1,0 +1,37 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "PadToken",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PadGame",
+      "constructorArgs": []
+    },
+    {
+      "contract": "PvPPad",
+      "constructorArgs": [
+        "$owner",
+        "$contract:PadToken",
+        "$contract:PadGame"
+      ]
+    },
+    {
+      "contract": "PadLiquidity",
+      "constructorArgs": [
+        "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "$contract:PvPPad"
+      ]
+    },
+    {
+      "contract": "KingOfThePad",
+      "constructorArgs": [
+        "$contract:PvPPad",
+        "$contract:PadLiquidity",
+        "0x5b95a971b4583a5f011e9da082acdd679b870d06"
+      ]
+    }
+  ],
+  "notes": "PvP Pad on Robinhood Chain (4663): launchpad where every launch is a fast Spireth dice game, all payments in ETH. Contracts only: no token, pool or distributor is minted at deployment; every token (genesis PVP included) is an EIP-1167 clone created later by the pad. Deploy order: PadToken() and PadGame() are templates, marked initialized at deployment so they can never be used directly; PvPPad(owner, tokenTemplate, gameTemplate) is the registry, clone factory, carry pot and open switch, owner = $owner (0x5b95...0d06, immutable) who may call openPad(salt) before day 30, after which anyone may; PadLiquidity(poolManager, pad) binds to PvPPad in its constructor and holds v4 graduation, locked LP, fee collection and the PVP burn bucket, poolManager = Uniswap v4 PoolManager 0x8366a39cc670b4001a1121b8f6a443a643e40951 (static, checked on first use only, never called in a constructor); KingOfThePad(pad, liquidity, dev) binds to both and calls PvPPad.startGenesis(), creating launch #1 'Pepes Value Pepes'; dev = 0x5b95a971b4583a5f011e9da082acdd679b870d06 as the brief states (same wallet as $owner), receives 25% of king extras. PadHook is not in the manifest: openPad(salt) CREATE2-deploys it from PadLiquidity at an address carrying exactly the beforeInitialize flag. Constructors are nonpayable, take only static addresses, $owner and earlier manifest contracts, and never call ArbSys, the PoolManager or anything outside the manifest. Nothing is owned by the factory or by IMD. Legal review before public launch (see README)."
+}
